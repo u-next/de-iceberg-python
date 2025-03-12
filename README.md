@@ -24,3 +24,6 @@ The documentation is available at [https://py.iceberg.apache.org/](https://py.ic
 # Get in Touch
 
 - [Iceberg community](https://iceberg.apache.org/community/)
+
+# Build
+- python m build (need Linux env)
