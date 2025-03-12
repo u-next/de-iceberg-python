@@ -98,6 +98,7 @@ class Endpoints:
     load_namespace_metadata: str = "namespaces/{namespace}"
     drop_namespace: str = "namespaces/{namespace}"
     update_namespace_properties: str = "namespaces/{namespace}/properties"
+    namespace_exists: str = "namespaces/{namespace}"
     list_tables: str = "trees/tree/{ref}/entries"
     create_table: str = "namespaces/{namespace}/tables"
     register_table = "namespaces/{namespace}/register"
@@ -151,7 +152,7 @@ def _retry_hook(retry_state: RetryCallState) -> None:
 
 
 _RETRY_ARGS = {
-    "retry": retry_if_exception_type(AuthorizationExpiredError, UnauthorizedError)),
+    "retry": retry_if_exception_type((AuthorizationExpiredError, UnauthorizedError)),
     "stop": stop_after_attempt(2),
     "before_sleep": _retry_hook,
     "reraise": True,
@@ -545,7 +546,7 @@ class RestCatalog(Catalog):
 
     def _response_to_staged_table(self, identifier_tuple: Tuple[str, ...], table_response: TableResponse) -> StagedTable:
         return StagedTable(
-            identifier=identifier_tuple if self.name else identifier_tuple,
+            identifier=identifier_tuple,
             metadata_location=table_response.metadata_location,  # type: ignore
             metadata=table_response.metadata,
             io=self._load_file_io(
