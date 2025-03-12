@@ -16,6 +16,10 @@
 #  under the License.
 from enum import Enum
 from json import JSONDecodeError
+import json
+import requests
+from typing import Union, Tuple
+from requests.exceptions import HTTPError
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -79,7 +83,7 @@ from pyiceberg.table.update import (
 from pyiceberg.typedef import EMPTY_DICT, UTF8, IcebergBaseModel, Identifier, Properties
 from pyiceberg.types import transform_dict_value_to_str
 from pyiceberg.utils.deprecated import deprecation_message
-from pyiceberg.utils.properties import get_header_properties, property_as_bool
+from pyiceberg.utils.properties import get_first_property_value, property_as_bool
 
 if TYPE_CHECKING:
     import pyarrow as pa
@@ -94,11 +98,10 @@ class Endpoints:
     load_namespace_metadata: str = "namespaces/{namespace}"
     drop_namespace: str = "namespaces/{namespace}"
     update_namespace_properties: str = "namespaces/{namespace}/properties"
-    namespace_exists: str = "namespaces/{namespace}"
-    list_tables: str = "namespaces/{namespace}/tables"
+    list_tables: str = "trees/tree/{ref}/entries"
     create_table: str = "namespaces/{namespace}/tables"
     register_table = "namespaces/{namespace}/register"
-    load_table: str = "namespaces/{namespace}/tables/{table}"
+    load_table: str = "contents/{table}"
     update_table: str = "namespaces/{namespace}/tables/{table}"
     drop_table: str = "namespaces/{namespace}/tables/{table}?purgeRequested={purge}"
     table_exists: str = "namespaces/{namespace}/tables/{table}"
@@ -137,7 +140,9 @@ SSL = "ssl"
 SIGV4 = "rest.sigv4-enabled"
 SIGV4_REGION = "rest.signing-region"
 SIGV4_SERVICE = "rest.signing-name"
+AUTH_URL = "rest.authorization-url"
 OAUTH2_SERVER_URI = "oauth2-server-uri"
+HEADER_PREFIX = "header."
 
 NAMESPACE_SEPARATOR = b"\x1f".decode(UTF8)
 
@@ -148,7 +153,7 @@ def _retry_hook(retry_state: RetryCallState) -> None:
 
 
 _RETRY_ARGS = {
-    "retry": retry_if_exception_type((AuthorizationExpiredError, UnauthorizedError)),
+    "retry": retry_if_exception_type(AuthorizationExpiredError),
     "stop": stop_after_attempt(2),
     "before_sleep": _retry_hook,
     "reraise": True,
@@ -156,7 +161,7 @@ _RETRY_ARGS = {
 
 
 class TableResponse(IcebergBaseModel):
-    metadata_location: Optional[str] = Field(alias="metadata-location", default=None)
+    metadata_location: Optional[str] = Field(alias="metadataLocation", default=None)
     metadata: TableMetadata
     config: Properties = Field(default_factory=dict)
 
@@ -191,8 +196,10 @@ class TokenResponse(IcebergBaseModel):
 
 
 class ConfigResponse(IcebergBaseModel):
-    defaults: Properties = Field()
-    overrides: Properties = Field()
+    defaults: Optional[Properties] = Field(default=None)
+    overrides: Optional[Properties] = Field(default=None)
+    default_branch: Optional[str] = Field(alias="defaultBranch", default=None)
+    #supported_api_versions: Optional[List[int]] = Field(alias="maxSupportedApiVersion", default=None)
 
 
 class ListNamespaceResponse(IcebergBaseModel):
@@ -250,7 +257,7 @@ class RestCatalog(Catalog):
     uri: str
     _session: Session
 
-    def __init__(self, name: str, **properties: str):
+    def __init__(self, name: str, gcs_credentials: Optional[str] = None, **properties: str):
         """Rest Catalog.
 
         You either need to provide a client_id and client_secret, or an already valid token.
@@ -261,6 +268,7 @@ class RestCatalog(Catalog):
         """
         super().__init__(name, **properties)
         self.uri = properties[URI]
+        self.credential_file_path = gcs_credentials
         self._fetch_config()
         self._session = self._create_session()
 
@@ -289,9 +297,17 @@ class RestCatalog(Catalog):
 
         return session
 
-    def _check_valid_namespace_identifier(self, identifier: Union[str, Identifier]) -> Identifier:
+    def _check_valid_namespace_identifier(self, identifier: Union[str, Identifier, Dict]) -> Identifier:
         """Check if the identifier has at least one element."""
-        identifier_tuple = Catalog.identifier_to_tuple(identifier)
+        if isinstance(identifier, dict):
+        
+            if "elements" in identifier:
+                identifier_tuple = tuple(identifier["elements"])
+            else:
+                raise NoSuchNamespaceError(f"Invalid namespace identifier: {identifier}")
+        else:
+            identifier_tuple = Catalog.identifier_to_tuple(identifier)
+
         if len(identifier_tuple) < 1:
             raise NoSuchNamespaceError(f"Empty namespace identifier: {identifier}")
         return identifier_tuple
@@ -317,9 +333,16 @@ class RestCatalog(Catalog):
 
     @property
     def auth_url(self) -> str:
+        if self.properties.get(AUTH_URL):
+            deprecation_message(
+                deprecated_in="0.8.0",
+                removed_in="0.9.0",
+                help_message=f"The property {AUTH_URL} is deprecated. Please use {OAUTH2_SERVER_URI} instead",
+            )
+
         self._warn_oauth_tokens_deprecation()
 
-        if url := self.properties.get(OAUTH2_SERVER_URI):
+        if url := get_first_property_value(self.properties, AUTH_URL, OAUTH2_SERVER_URI):
             return url
         else:
             return self.url(Endpoints.get_token, prefixed=False)
@@ -383,11 +406,18 @@ class RestCatalog(Catalog):
             response.raise_for_status()
         except HTTPError as exc:
             self._handle_non_200_response(exc, {})
-        config_response = ConfigResponse(**response.json())
 
-        config = config_response.defaults
+    
+        config_data = response.json()
+        if "defaults" not in config_data:
+            config_data["defaults"] = {}
+        if "overrides" not in config_data:
+            config_data["overrides"] = {}
+
+        config_response = ConfigResponse(**config_data)
+        config = config_response.defaults or {}
         config.update(self.properties)
-        config.update(config_response.overrides)
+        config.update(config_response.overrides or {})
         self.properties = config
 
         # Update URI based on overrides
@@ -524,7 +554,7 @@ class RestCatalog(Catalog):
 
     def _response_to_staged_table(self, identifier_tuple: Tuple[str, ...], table_response: TableResponse) -> StagedTable:
         return StagedTable(
-            identifier=identifier_tuple,
+            identifier=identifier_tuple if self.name else identifier_tuple,
             metadata_location=table_response.metadata_location,  # type: ignore
             metadata=table_response.metadata,
             io=self._load_file_io(
@@ -545,12 +575,15 @@ class RestCatalog(Catalog):
             session.headers[AUTHORIZATION_HEADER] = f"{BEARER_PREFIX} {token}"
 
     def _config_headers(self, session: Session) -> None:
-        header_properties = get_header_properties(self.properties)
+        header_properties = self._extract_headers_from_properties()
         session.headers.update(header_properties)
         session.headers["Content-type"] = "application/json"
         session.headers["X-Client-Version"] = ICEBERG_REST_SPEC_VERSION
         session.headers["User-Agent"] = f"PyIceberg/{__version__}"
         session.headers.setdefault("X-Iceberg-Access-Delegation", ACCESS_DELEGATION_DEFAULT)
+
+    def _extract_headers_from_properties(self) -> Dict[str, str]:
+        return {key[len(HEADER_PREFIX) :]: value for key, value in self.properties.items() if key.startswith(HEADER_PREFIX)}
 
     def _create_table(
         self,
@@ -567,6 +600,7 @@ class RestCatalog(Catalog):
         fresh_partition_spec = assign_fresh_partition_spec_ids(partition_spec, iceberg_schema, fresh_schema)
         fresh_sort_order = assign_fresh_sort_order_ids(sort_order, iceberg_schema, fresh_schema)
 
+        identifier = self._identifier_to_tuple_without_catalog(identifier)
         namespace_and_table = self._split_identifier_for_path(identifier)
         if location:
             location = location.rstrip("/")
@@ -647,6 +681,7 @@ class RestCatalog(Catalog):
         Raises:
             TableAlreadyExistsError: If the table already exists
         """
+        identifier = self._identifier_to_tuple_without_catalog(identifier)
         namespace_and_table = self._split_identifier_for_path(identifier)
         request = RegisterTableRequest(
             name=namespace_and_table["table"],
@@ -666,31 +701,89 @@ class RestCatalog(Catalog):
         return self._response_to_table(self.identifier_to_tuple(identifier), table_response)
 
     @retry(**_RETRY_ARGS)
-    def list_tables(self, namespace: Union[str, Identifier]) -> List[Identifier]:
-        namespace_tuple = self._check_valid_namespace_identifier(namespace)
-        namespace_concat = NAMESPACE_SEPARATOR.join(namespace_tuple)
-        response = self._session.get(self.url(Endpoints.list_tables, namespace=namespace_concat))
+    def list_tables(self, namespace: Union[str, Identifier, Dict]) -> List[Identifier]:
+        response = self._session.get(
+            self.url(Endpoints.list_tables, ref=self.properties.get('defaultBranch', 'main'))
+        )
+        #response = self._session.get(self.url(Endpoints.list_tables))
         try:
             response.raise_for_status()
         except HTTPError as exc:
             self._handle_non_200_response(exc, {404: NoSuchNamespaceError})
-        return [(*table.namespace, table.name) for table in ListTablesResponse(**response.json()).identifiers]
+
+        response_data = response.json()["entries"]
+        
+        tables = []
+        for table in response_data:
+            if table["type"] == "ICEBERG_TABLE":
+                name_elements = table["name"]["elements"]
+                if name_elements[0] == namespace[0]:
+                    tables.append([f"{name_elements[0]}.{name_elements[1]}"])    
+        return tables
 
     @retry(**_RETRY_ARGS)
     def load_table(self, identifier: Union[str, Identifier]) -> Table:
-        response = self._session.get(self.url(Endpoints.load_table, prefixed=True, **self._split_identifier_for_path(identifier)))
+        response = self._session.get(
+            self.url(Endpoints.load_table, table=identifier[0])
+        )
         try:
             response.raise_for_status()
         except HTTPError as exc:
             self._handle_non_200_response(exc, {404: NoSuchTableError})
 
-        table_response = TableResponse(**response.json())
-        return self._response_to_table(self.identifier_to_tuple(identifier), table_response)
+        metadata_location = response.json().get("metadataLocation")
+        if not metadata_location:
+            raise ValueError("Metadata location missing in response")
+
+        metadata_content = self._fetch_metadata_content(metadata_location)
+        metadata_content = self._fix_format_version(metadata_content)
+        table_response = TableResponse(
+            metadata_location=metadata_location,
+            metadata=metadata_content,
+            config={}  
+        )
+        
+        return self._response_to_table(self.identifier_to_tuple(identifier[0]),table_response)
+
+    def _fetch_metadata_content(self, metadata_location: str) -> dict:
+        if metadata_location.startswith("gs://"):
+
+            from google.cloud import storage
+            from google.oauth2 import service_account
+            
+            if self.credential_file_path:
+                credentials = service_account.Credentials.from_service_account_file(self.credential_file_path)
+                client = storage.Client(credentials=credentials)
+            else:
+                client = storage.Client()
+            bucket_name, blob_name = self._parse_gcs_uri(metadata_location)
+            bucket = client.bucket(bucket_name)
+            blob = bucket.blob(blob_name)
+            content = blob.download_as_text()
+            return json.loads(content)
+        else:
+            response = requests.get(metadata_location)
+            response.raise_for_status()
+            return response.json()
+
+    def _parse_gcs_uri(self, gcs_uri: str) -> Tuple[str, str]:
+        parts = gcs_uri[5:].split("/", 1)
+        if len(parts) != 2:
+            raise ValueError(f"Invalid GCS URI format: {gcs_uri}")
+        return parts[0], parts[1]
+
+    def _fix_format_version(self, metadata_content: dict) -> dict:
+        if "format-version" in metadata_content:
+            metadata_content["format_version"] = metadata_content.pop("format-version")
+        return metadata_content
 
     @retry(**_RETRY_ARGS)
     def drop_table(self, identifier: Union[str, Identifier], purge_requested: bool = False) -> None:
+        identifier_tuple = self._identifier_to_tuple_without_catalog(identifier)
         response = self._session.delete(
-            self.url(Endpoints.drop_table, prefixed=True, purge=purge_requested, **self._split_identifier_for_path(identifier)),
+            self.url(
+                Endpoints.drop_table, prefixed=True, purge=purge_requested, **self._split_identifier_for_path(identifier_tuple)
+            ),
         )
         try:
             response.raise_for_status()
@@ -703,8 +796,9 @@ class RestCatalog(Catalog):
 
     @retry(**_RETRY_ARGS)
     def rename_table(self, from_identifier: Union[str, Identifier], to_identifier: Union[str, Identifier]) -> Table:
+        from_identifier_tuple = self._identifier_to_tuple_without_catalog(from_identifier)
         payload = {
-            "source": self._split_identifier_for_json(from_identifier),
+            "source": self._split_identifier_for_json(from_identifier_tuple),
             "destination": self._split_identifier_for_json(to_identifier),
         }
         response = self._session.post(self.url(Endpoints.rename_table), json=payload)
@@ -805,20 +899,25 @@ class RestCatalog(Catalog):
 
     @retry(**_RETRY_ARGS)
     def list_namespaces(self, namespace: Union[str, Identifier] = ()) -> List[Identifier]:
-        namespace_tuple = self.identifier_to_tuple(namespace)
         response = self._session.get(
             self.url(
-                f"{Endpoints.list_namespaces}?parent={NAMESPACE_SEPARATOR.join(namespace_tuple)}"
-                if namespace_tuple
-                else Endpoints.list_namespaces
+                f"{Endpoints.list_namespaces}/{self.properties.get('defaultBranch', 'main')}"
             ),
         )
         try:
             response.raise_for_status()
         except HTTPError as exc:
             self._handle_non_200_response(exc, {})
-
-        return ListNamespaceResponse(**response.json()).namespaces
+        
+        response_data = response.json()
+        namespaces = []
+        if "namespaces" in response_data:
+            for ns in response_data["namespaces"]:
+                if "elements" in ns and isinstance(ns["elements"], list) and ns["elements"]:
+                    if len(ns["elements"]) > 0:
+                        namespaces.append(ns["elements"])
+    
+        return namespaces
 
     @retry(**_RETRY_ARGS)
     def load_namespace_properties(self, namespace: Union[str, Identifier]) -> Properties:
@@ -852,24 +951,6 @@ class RestCatalog(Catalog):
         )
 
     @retry(**_RETRY_ARGS)
-    def namespace_exists(self, namespace: Union[str, Identifier]) -> bool:
-        namespace_tuple = self._check_valid_namespace_identifier(namespace)
-        namespace = NAMESPACE_SEPARATOR.join(namespace_tuple)
-        response = self._session.head(self.url(Endpoints.namespace_exists, namespace=namespace))
-
-        if response.status_code == 404:
-            return False
-        elif response.status_code in (200, 204):
-            return True
-
-        try:
-            response.raise_for_status()
-        except HTTPError as exc:
-            self._handle_non_200_response(exc, {})
-
-        return False
-
-    @retry(**_RETRY_ARGS)
     def table_exists(self, identifier: Union[str, Identifier]) -> bool:
         """Check if a table exists.
 
@@ -879,13 +960,14 @@ class RestCatalog(Catalog):
         Returns:
             bool: True if the table exists, False otherwise.
         """
+        identifier_tuple = self._identifier_to_tuple_without_catalog(identifier)
         response = self._session.head(
-            self.url(Endpoints.load_table, prefixed=True, **self._split_identifier_for_path(identifier))
+            self.url(Endpoints.load_table, prefixed=True, **self._split_identifier_for_path(identifier_tuple))
         )
 
         if response.status_code == 404:
             return False
-        elif response.status_code in (200, 204):
+        elif response.status_code == 204:
             return True
 
         try:
@@ -922,8 +1004,11 @@ class RestCatalog(Catalog):
 
     @retry(**_RETRY_ARGS)
     def drop_view(self, identifier: Union[str]) -> None:
+        identifier_tuple = self._identifier_to_tuple_without_catalog(identifier)
         response = self._session.delete(
-            self.url(Endpoints.drop_view, prefixed=True, **self._split_identifier_for_path(identifier, IdentifierKind.VIEW)),
+            self.url(
+                Endpoints.drop_view, prefixed=True, **self._split_identifier_for_path(identifier_tuple, IdentifierKind.VIEW)
+            ),
         )
         try:
             response.raise_for_status()
